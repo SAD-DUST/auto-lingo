@@ -1,4 +1,4 @@
-import requests, subprocess, time, concurrent.futures, json
+import requests, subprocess, time, concurrent.futures, json, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
@@ -37,10 +37,7 @@ def check_proxy(proxy: str) -> str | None:
         proxies = {scheme: f"{scheme}://{address}"}
     else:
         address = proxy.replace("http://", "").replace("https://", "")
-        proxies = {
-            "http": f"http://{address}",
-            "https": f"http://{address}",
-        }
+        proxies = {"http": f"http://{address}", "https": f"http://{address}"}
 
     try:
         r = requests.get(TARGET_PAGE, proxies=proxies, timeout=TIMEOUT, verify=False)
@@ -53,11 +50,17 @@ def check_proxy(proxy: str) -> str | None:
     return None
 
 def get_alive_proxies():
+    # auto-create proxy.txt if missing
+    if not os.path.exists(INPUT_FILE):
+        console.print("[yellow][!] proxy.txt không tồn tại, tạo file mới[/yellow]")
+        open(INPUT_FILE, "w", encoding="utf-8").close()
+        return []
+
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         proxies = [line.strip() for line in f if line.strip()]
 
     alive = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
+    with ThreadPoolExecutor(max_workers=THREADS) as executor:
         results = list(executor.map(check_proxy, proxies))
     for result in results:
         if result:
@@ -68,6 +71,12 @@ def get_alive_proxies():
 
 # ========== PHẦN 2: SPAM VOTE ==========
 def send_request(proxy: str):
+    # auto-create data.txt if missing
+    if not os.path.exists(DATA_FILE):
+        console.print("[yellow][!] data.txt không tồn tại, tạo file mới[/yellow]")
+        open(DATA_FILE, "w", encoding="utf-8").close()
+        return f"[red][!][/red] {proxy} ❌ data.txt trống"
+
     cmd = [
         "curl", VOTE_API,
         "--proxy", proxy,
@@ -114,8 +123,12 @@ def show_votes():
         "Referer": TARGET_PAGE,
     }
 
-    res = requests.get(VOTE_VIEW_API, headers=headers)
-    data = res.json()
+    try:
+        res = requests.get(VOTE_VIEW_API, headers=headers, timeout=TIMEOUT)
+        data = res.json()
+    except Exception as e:
+        console.print(f"[red][!] Không thể tải kết quả vote: {e}[/red]")
+        return
 
     for poll in data:
         table = Table(title=f"📊 {poll['question']}", title_style="bold magenta")
@@ -140,13 +153,9 @@ def main():
         alive = get_alive_proxies()
 
         console.rule("[bold magenta]🚀 Spamming votes")
-        spam_vote(alive)
-        console.rule("[bold magenta]🚀 Spamming votes p.2")
-        spam_vote(alive)
-        console.rule("[bold magenta]🚀 Spamming votes p.3")
-        spam_vote(alive)
-        console.rule("[bold magenta]🚀 Spamming votes p.4")
-        spam_vote(alive)
+        for i in range(1, 5):
+            console.rule(f"[bold magenta]🚀 Spamming votes p.{i}")
+            spam_vote(alive)
 
         console.rule("[bold magenta]📺 Showing results")
         show_votes()
